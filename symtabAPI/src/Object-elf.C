@@ -1986,8 +1986,7 @@ bool ObjectELF::parse_symbols(Elf_X_Data &symdata, Elf_X_Data &strdata,
     const char *strs = strdata.get_string();
     if (syms.isValid()) {
         std::vector<Symbol*> newsyms(syms.count());
-        {
-        #pragma omp for schedule(dynamic)
+        #pragma omp parallel for schedule(dynamic)
         for (unsigned i = 0; i < syms.count(); i++) {
             //If it is not a dynamic executable then we need undefined symbols
             //in symtab section so that we can resolve symbol references. So
@@ -2100,7 +2099,6 @@ bool ObjectELF::parse_symbols(Elf_X_Data &symdata, Elf_X_Data &strdata,
             if(!symsByOffset_.insert(a2, {newsym->getOffset(), {newsym}}))
                 a2->second.push_back(newsym);
             }
-        }
         }
     }
 #if defined(TIMED_PARSE)
