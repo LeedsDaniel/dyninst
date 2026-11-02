@@ -714,7 +714,26 @@ bool Symtab::addFunctionRange(FunctionBase *func, Dyninst::Offset next_start)
    return true;
 }
 
+// Build the function range table (func_lookup) and sort everyFunction,
+// exactly once per Symtab.  Thread-safe: concurrent callers wait for
+// the one build to finish.  Calling it again does not rebuild, so any
+// symbols must be added before the first call or lookup.
+//
+// The lookups below call this too, so explicit calls are only needed to
+// control when the build runs (e.g., before going multi-threaded).
+// Before, this was the build itself, outside the lookups' call_once, so
+// an explicit call followed by a lookup built the table twice and added
+// duplicate ranges for functions known only by their symbol.
 bool Symtab::parseFunctionRanges()
+{
+   std::call_once(impl->funcRangesAreParsed, [this](){ this->parseFunctionRangesOnce(); });
+   return true;
+}
+
+// Called only from parseFunctionRanges(), under its call_once.  Must not
+// call parseFunctionRanges() or the lookups on this Symtab: that would
+// re-enter the same call_once and deadlock.
+void Symtab::parseFunctionRangesOnce()
 {
    parseTypesNow();
 
@@ -744,8 +763,6 @@ bool Symtab::parseFunctionRanges()
       //Add current function to lookups.
       addFunctionRange(*i, next_addr);
    }
-
-   return true;
 }
 
 bool Symtab::getContainingFunction(Offset offset, Function* &func)
@@ -754,8 +771,8 @@ bool Symtab::getContainingFunction(Offset offset, Function* &func)
       return false;
    }
 
-   // Lazily parse the function ranges, but ensure we only do it once.
-   std::call_once(impl->funcRangesAreParsed, [this](){ this->parseFunctionRanges(); });
+   // Lazily parse the function ranges (once; see parseFunctionRanges).
+   parseFunctionRanges();
    
    unsigned low = 0;
    unsigned high = everyFunction.size();
@@ -795,8 +812,8 @@ bool Symtab::getContainingFunction(Offset offset, Function* &func)
 
 bool Symtab::getContainingInlinedFunction(Offset offset, FunctionBase* &func)
 {   
-   // Lazily parse the function ranges, but ensure we only do it once.
-   std::call_once(impl->funcRangesAreParsed, [this](){ this->parseFunctionRanges(); });
+   // Lazily parse the function ranges (once; see parseFunctionRanges).
+   parseFunctionRanges();
    
    set<FuncRange *> ranges;
    int num_found = impl->func_lookup.find(offset, ranges);

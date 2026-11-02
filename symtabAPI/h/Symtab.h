@@ -427,6 +427,10 @@ class DYNINST_EXPORT Symtab : public LookupInterface,
    bool canBeShared();
    DYNINST_DEPRECATED("Use getContainingModule")
    Module *getOrCreateModule(const std::string &modName, const Offset modAddr);
+   // Builds the function range table used by getContainingFunction()
+   // and getContainingInlinedFunction(), once; later calls do nothing.
+   // Thread-safe.  Symbols added after the first call (or first lookup)
+   // are not added to the table.
    bool parseFunctionRanges();
 
    //Only valid on ELF formats
@@ -449,6 +453,7 @@ class DYNINST_EXPORT Symtab : public LookupInterface,
    void parseLineInformation();
    
    void parseTypes();
+   void parseFunctionRangesOnce();
    bool setDefaultNamespacePrefix(std::string str);
 
    bool addUserRegion(Region *newreg);
