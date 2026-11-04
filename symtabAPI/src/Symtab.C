@@ -538,16 +538,39 @@ bool Symtab::createIndices(std::vector<Symbol *> &raw_syms, bool undefined) {
  * to refer to these aggregates, and build those objects here. 
  */
 
+// Functions and Variables created by a thread during createAggregates, added to
+// everyFunction/everyVariable once at the end instead of one at a time.
+namespace {
+struct AggregateBatch {
+  std::vector<Function *> funcs;
+  std::vector<Variable *> vars;
+};
+thread_local AggregateBatch *aggregateBatch = NULL;
+}
+
 bool Symtab::createAggregates() 
 {
   std::vector<Symbol*> syms(impl->everyDefinedSymbol.begin(), impl->everyDefinedSymbol.end());
 
-  #pragma omp parallel for
-  for(size_t i = 0; i < syms.size(); ++i)
+  #pragma omp parallel
   {
-    if (!doNotAggregate(syms[i])) {
-      addSymbolToAggregates(syms[i]);
+    AggregateBatch batch;
+    aggregateBatch = &batch;
+
+    #pragma omp for nowait
+    for(size_t i = 0; i < syms.size(); ++i)
+    {
+      if (!doNotAggregate(syms[i])) {
+        addSymbolToAggregates(syms[i]);
+      }
     }
+
+    aggregateBatch = NULL;
+    boost::unique_lock<dyn_rwlock> l(symbols_rwlock);
+    everyFunction.insert(everyFunction.end(), batch.funcs.begin(), batch.funcs.end());
+    if (!batch.funcs.empty())
+      sorted_everyFunction = false;
+    everyVariable.insert(everyVariable.end(), batch.vars.begin(), batch.vars.end());
   }
     return true;
 }
@@ -590,6 +613,10 @@ bool Symtab::addSymbolToAggregates(const Symbol *sym_tmp)
         //   Keep module information
 
         auto add_func = [this](Function *f) {
+          if (aggregateBatch) {
+            aggregateBatch->funcs.push_back(f);
+            return;
+          }
 	  boost::unique_lock<dyn_rwlock> l(symbols_rwlock);
 	  everyFunction.push_back(f);
 	  sorted_everyFunction = false;
@@ -639,6 +666,14 @@ bool Symtab::addSymbolToAggregates(const Symbol *sym_tmp)
     case Symbol::ST_TLS:
     case Symbol::ST_OBJECT: {
         // The same as the above, but with variables.
+        auto add_var = [this](Variable *v) {
+          if (aggregateBatch) {
+            aggregateBatch->vars.push_back(v);
+            return;
+          }
+          boost::unique_lock<dyn_rwlock> l(symbols_rwlock);
+          everyVariable.push_back(v);
+        };
         Variable *var = NULL;
         bool found = false;
         {
@@ -676,14 +711,12 @@ bool Symtab::addSymbolToAggregates(const Symbol *sym_tmp)
                   NULL == sym->getRegion() ) )
             {
                 var = new Variable(sym);
-                boost::unique_lock<dyn_rwlock> l(symbols_rwlock);
-                everyVariable.push_back(var);
+                add_var(var);
             }else{
                 var->addSymbol(sym);
             }
         } else {
-            boost::unique_lock<dyn_rwlock> l(symbols_rwlock);
-            everyVariable.push_back(var);
+            add_var(var);
         }
         sym->setVariable(var);
         break;
@@ -892,10 +925,6 @@ bool sort_reg_by_addr(const Region* a, const Region* b)
   return a->getMemOffset() < b->getMemOffset();
 }
 
-static bool ExceptionBlockCmp(ExceptionBlock *a, ExceptionBlock *b) {
-    return a->catchStart() < b->catchStart();
-}
-
 bool Symtab::extractInfo(Object *linkedFile)
 {
 #if defined(TIMED_PARSE)
@@ -1050,7 +1079,21 @@ bool Symtab::extractInfo(Object *linkedFile)
 
     
     linkedFile->getAllExceptions(excpBlocks);
-    sort(excpBlocks.begin(), excpBlocks.end(), ExceptionBlockCmp);
+    // Sort on cached catchStart values. Compare the key only, so the order
+    // matches sorting the blocks by catchStart.
+    {
+    std::vector<std::pair<Offset, size_t>> order(excpBlocks.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        order[i] = std::make_pair(excpBlocks[i]->catchStart(), i);
+    sort(order.begin(), order.end(),
+         [](const std::pair<Offset, size_t> &x, const std::pair<Offset, size_t> &y) {
+             return x.first < y.first;
+         });
+    std::vector<ExceptionBlock *> sorted(order.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        sorted[i] = excpBlocks[order[i].second];
+    excpBlocks.swap(sorted);
+    }
 
     vector<relocationEntry >fbt;
     linkedFile->get_func_binding_table(fbt);
