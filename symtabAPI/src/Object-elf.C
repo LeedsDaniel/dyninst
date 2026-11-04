@@ -83,6 +83,10 @@ using namespace std;
 
 #include "SymReader.h"
 #include <endian.h>
+
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 using namespace boost::assign;
 
 // add some space to avoid looking for functions in data regions
@@ -1059,6 +1063,18 @@ bool ObjectELF::get_relocationRelr_entries(unsigned relr_scnp_index) {
 /* parse relocations for the sections represented by DT_REL/DT_RELA in
  * the dynamic section. This section is the one we would want to emit
  */
+// Filling preallocated slots in parallel costs more per entry than
+// appending (each assignment searches the global annotation tables), so it is
+// used only when it can pay off: more than one thread and enough entries.
+static bool useParallelFill(size_t nentries) {
+#if defined(_OPENMP)
+    return nentries >= 4096 && omp_get_max_threads() > 1;
+#else
+    (void) nentries;
+    return false;
+#endif
+}
+
 bool ObjectELF::get_relocationDyn_entries(unsigned rel_scnp_index,
                                        Elf_X_Shdr *&dynsym_scnp,
                                        Elf_X_Shdr *&dynstr_scnp) {
@@ -1086,41 +1102,39 @@ bool ObjectELF::get_relocationDyn_entries(unsigned rel_scnp_index,
         Elf_X_Rela rela = reldata.get_rela();
 
         if (sym.isValid() && (rel.isValid() || rela.isValid()) && strs) {
-            /* Iterate over the entries. */
-            for (u_int i = 0; i < (reldata.d_size() / rel_entry_size_); ++i) {
-                num_rel_entries_found++;
+            size_t nrels = reldata.d_size() / rel_entry_size_;
+            if (nrels > 0 && reldata.d_type() != ELF_T_REL && reldata.d_type() != ELF_T_RELA) {
+                // We should never reach this case.
+                return false;
+            }
+            num_rel_entries_found += nrels;
+
+            auto buildEntry = [&](size_t i) {
                 long offset;
                 long addend;
                 long index;
                 unsigned long type;
                 Region::RegionType rtype = Region::RT_REL;
 
-                switch (reldata.d_type()) {
-                    case ELF_T_REL:
-                        offset = rel.r_offset(i);
-                        addend = 0;
-                        index = rel.R_SYM(i);
-                        type = rel.R_TYPE(i);
-                        break;
-
-                    case ELF_T_RELA:
-                        offset = rela.r_offset(i);
-                        addend = rela.r_addend(i);
-                        index = rela.R_SYM(i);
-                        type = rela.R_TYPE(i);
-                        rtype = Region::RT_RELA;
-                        break;
-
-                    default:
-                        // We should never reach this case.
-                        return false;
-                };
+                if (reldata.d_type() == ELF_T_REL) {
+                    offset = rel.r_offset(i);
+                    addend = 0;
+                    index = rel.R_SYM(i);
+                    type = rel.R_TYPE(i);
+                } else {
+                    offset = rela.r_offset(i);
+                    addend = rela.r_addend(i);
+                    index = rela.R_SYM(i);
+                    type = rela.R_TYPE(i);
+                    rtype = Region::RT_RELA;
+                }
                 relocationEntry re(offset, string(&strs[sym.st_name(index)]), NULL, type);
                 re.setAddend(addend);
                 re.setRegionType(rtype);
-                dyn_c_hash_map<std::string, std::vector<Symbol*>>::accessor a;
+                {
+                dyn_c_hash_map<std::string, std::vector<Symbol*>>::const_accessor a;
                 if (symbols_.find(a, &strs[sym.st_name(index)])) {
-                    vector<Symbol *> &syms = a->second;
+                    const vector<Symbol *> &syms = a->second;
                     for (auto s: syms) {
                         if (!s->isInDynSymtab())
                             continue;
@@ -1128,8 +1142,25 @@ bool ObjectELF::get_relocationDyn_entries(unsigned rel_scnp_index,
                         break;
                     }
                 }
+                }
+                return re;
+            };
 
-                relocation_table_.push_back(re);
+            size_t base = relocation_table_.size();
+            if (useParallelFill(nrels)) {
+                // Built in parallel and written straight into their slots, in
+                // index order.  Assigning into a relocationEntry reads the
+                // global annotation tables (AnnotatableSparse); nothing writes
+                // to them during this loop.
+                relocation_table_.resize(base + nrels);
+                #pragma omp parallel for schedule(dynamic, 4096)
+                for (size_t i = 0; i < nrels; ++i)
+                    relocation_table_[base + i] = buildEntry(i);
+            } else {
+                relocation_table_.reserve(base + nrels);
+                /* Iterate over the entries. */
+                for (size_t i = 0; i < nrels; ++i)
+                    relocation_table_.push_back(buildEntry(i));
             }
         } else {
             return false;
@@ -1456,6 +1487,14 @@ bool ObjectELF::get_relocation_entries(Elf_X_Shdr *&rel_plt_scnp,
                 if (fbt_.size() > 0 && !fbt_[0].rel_addr() && fbt_[0].name() != "@plt")
                     fbt_iter = 0;
 
+                // Room for the new entries; growing one push_back at a time
+                // reallocates repeatedly.  Bounded by the section's data so
+                // a bad DT_PLTRELSZ cannot request a huge allocation.
+                if (fbt_iter == -1) {
+                    unsigned long plt_bytes = std::min<unsigned long>(rel_plt_size_, reldata.d_size());
+                    fbt_.reserve(fbt_.size() + plt_bytes / rel_plt_entry_size_);
+                }
+
                 for (u_int i = 0; i < (rel_plt_size_ / rel_plt_entry_size_); ++i) {
                     long offset;
                     long addend;
@@ -1505,22 +1544,29 @@ bool ObjectELF::get_relocation_entries(Elf_X_Shdr *&rel_plt_scnp,
                         relocationEntry re(next_plt_entry_addr, offset, targ_name,
                                            NULL, type);
                         if (type == R_X86_64_IRELATIVE) {
-                            vector<Symbol *> funcs;
-                            dyn_c_hash_map<std::string, std::vector<Symbol *> >::iterator iter;
                             // find the resolver function and use that as the
                             // caller function symbol.  The resolver has not run
                             // so we don't know the ultimate destination.
                             // Since the funcsByOffset map hasn't been setup yet
                             // we cannot call associated_symtab->findFuncByEntryOffset
-                            for (iter = symbols_.begin(); iter != symbols_.end(); ++iter) {
-                                std::string name = iter->first;
-                                Symbol *s = iter->second[0];
-                                if (s->getOffset() == (Offset) addend) {
-                                    // Use dynsym_list.push_back(sym) instead?
-                                    re.addDynSym(s);
-                                    break;
+                            // Several aliases may share the resolver's address;
+                            // take the one first in the symbol tables (.symtab
+                            // before .dynsym) so the choice does not depend on
+                            // hash map order.
+                            Symbol *resolver = NULL;
+                            {
+                            dyn_c_hash_map<Offset, std::vector<Symbol *> >::const_accessor ca;
+                            if (symsByOffset_.find(ca, (Offset) addend)) {
+                                for (Symbol *s : ca->second) {
+                                    if (resolver == NULL ||
+                                        std::make_pair(s->isInDynSymtab(), s->getIndex()) <
+                                        std::make_pair(resolver->isInDynSymtab(), resolver->getIndex()))
+                                        resolver = s;
                                 }
                             }
+                            }
+                            if (resolver != NULL)
+                                re.addDynSym(resolver);
                         }
                         re.setAddend(addend);
                         re.setRegionType(rtype);
@@ -1627,7 +1673,7 @@ void ObjectELF::load_object(bool alloc_syms) {
                 parse_symbols(symdata, strdata, bssscnp, symscnp, symtab_shndx_scnp, false);
             }
 
-            no_of_symbols_ = nsymbols();
+            // no_of_symbols_ was set by parse_symbols (0 if it did not run)
 
             // try to resolve the module names of global symbols
             // DWARF format (.debug_info section)
@@ -1986,8 +2032,11 @@ bool ObjectELF::parse_symbols(Elf_X_Data &symdata, Elf_X_Data &strdata,
     const char *strs = strdata.get_string();
     if (syms.isValid()) {
         std::vector<Symbol*> newsyms(syms.count());
+        // Number of symbols registered in symbols_; becomes no_of_symbols_
+        // without walking the map afterwards.
+        unsigned long nregistered = 0;
         {
-        #pragma omp for schedule(dynamic)
+        #pragma omp parallel for schedule(dynamic, 1024) reduction(+:nregistered)
         for (unsigned i = 0; i < syms.count(); i++) {
             //If it is not a dynamic executable then we need undefined symbols
             //in symtab section so that we can resolve symbol references. So
@@ -2095,6 +2144,7 @@ bool ObjectELF::parse_symbols(Elf_X_Data &symdata, Elf_X_Data &strdata,
             if(!symbols_.insert(a, {sname, {newsym}}))
                 a->second.push_back(newsym);
             }
+            ++nregistered;
             {
             dyn_c_hash_map<Offset,std::vector<Symbol*>>::accessor a2;
             if(!symsByOffset_.insert(a2, {newsym->getOffset(), {newsym}}))
@@ -2102,6 +2152,7 @@ bool ObjectELF::parse_symbols(Elf_X_Data &symdata, Elf_X_Data &strdata,
             }
         }
         }
+        no_of_symbols_ = nregistered;
     }
 #if defined(TIMED_PARSE)
     struct timeval endtime;
@@ -2198,6 +2249,21 @@ dyn_scnp, Elf_X_Data &symdata,
     }
     if(!strs) return;
     if(syms.isValid()) {
+        // Symbols are created and registered in parallel.  Version
+        // annotations and the .opd list are filled in serially afterwards,
+        // because the annotation store is not thread safe.  Keys that end up
+        // with more than one dynamic symbol have those symbols put back in
+        // symbol table order: the relocation code takes the first dynamic
+        // symbol listed for a name.
+        std::vector<Symbol*> created(syms.count());
+        std::vector<Symbol*> registered(syms.count());
+        std::vector<std::string> dupNames;
+        std::vector<Offset> dupOffsets;
+        #pragma omp parallel
+        {
+        std::vector<std::string> myDupNames;
+        std::vector<Offset> myDupOffsets;
+        #pragma omp for schedule(dynamic, 1024) nowait
         for (unsigned i = 0; i < syms.count(); i++) {
             int etype = syms.ST_TYPE(i);
             int ebinding = syms.ST_BIND(i);
@@ -2242,36 +2308,84 @@ dyn_scnp, Elf_X_Data &symdata,
 
             if (stype == Symbol::ST_UNKNOWN)
                 newsym->setInternalType(etype);
+            created[i] = newsym;
 
+            // register symbol in dictionary
+
+            if (sec && sec->getRegionName() == OPD_NAME && stype == Symbol::ST_FUNCTION) {
+                newsym = handle_opd_symbol(sec, newsym);
+            }
+            registered[i] = newsym;
+            // Static symbols were all registered before this, so the entry
+            // before ours is dynamic only if the key already had one.
+            {
+            dyn_c_hash_map<std::string,std::vector<Symbol*>>::accessor a;
+            if(!symbols_.insert(a, {sname, {newsym}})) {
+                a->second.push_back(newsym);
+                if (a->second[a->second.size() - 2]->isInDynSymtab())
+                    myDupNames.push_back(sname);
+            }
+            }
+            {
+            dyn_c_hash_map<Offset,std::vector<Symbol*>>::accessor a2;
+            if(!symsByOffset_.insert(a2, {newsym->getOffset(), {newsym}})) {
+                a2->second.push_back(newsym);
+                if (a2->second[a2->second.size() - 2]->isInDynSymtab())
+                    myDupOffsets.push_back(newsym->getOffset());
+            }
+            }
+        }
+        #pragma omp critical
+        {
+        dupNames.insert(dupNames.end(), myDupNames.begin(), myDupNames.end());
+        dupOffsets.insert(dupOffsets.end(), myDupOffsets.begin(), myDupOffsets.end());
+        }
+        }
+
+        // Version annotations and the .opd list, in symbol table order.
+        for (unsigned i = 0; i < syms.count(); i++) {
+            Symbol *newsym = created[i];
+            if (newsym == NULL)
+                continue;
             if (versymSec) {
                 unsigned short raw = symVersions.get(i);
                 bool hidden = raw >> 15;
                 int index = raw & 0x7fff;
-                if (versionFileNameMapping.find(index) != versionFileNameMapping.end()) {
-                    newsym->setVersionFileName(versionFileNameMapping[index]);
+                auto fileName = versionFileNameMapping.find(index);
+                if (fileName != versionFileNameMapping.end()) {
+                    newsym->setVersionFileName(fileName->second);
                 }
-                if (versionMapping.find(index) != versionMapping.end()) {
-                    newsym->setVersions(versionMapping[index]);
+                auto versions = versionMapping.find(index);
+                if (versions != versionMapping.end()) {
+                    newsym->setVersions(versions->second);
                 }
                 if (hidden) {
                     newsym->setVersionHidden();
                 }
             }
-            // register symbol in dictionary
+            if (registered[i] != newsym)
+                opdsymbols_.push_back(registered[i]);
+        }
 
-            if (sec && sec->getRegionName() == OPD_NAME && stype == Symbol::ST_FUNCTION) {
-                newsym = handle_opd_symbol(sec, newsym);
-                opdsymbols_.push_back(newsym);
-            }
-            {
+        // Put the dynamic symbols of shared keys back in symbol table order.
+        auto byIndex = [](Symbol *s1, Symbol *s2) { return s1->getIndex() < s2->getIndex(); };
+        auto isDynamic = [](Symbol *s) { return s->isInDynSymtab(); };
+        std::sort(dupNames.begin(), dupNames.end());
+        dupNames.erase(std::unique(dupNames.begin(), dupNames.end()), dupNames.end());
+        for (auto &name : dupNames) {
             dyn_c_hash_map<std::string,std::vector<Symbol*>>::accessor a;
-            if(!symbols_.insert(a, {sname, {newsym}}))
-                a->second.push_back(newsym);
+            if (symbols_.find(a, name)) {
+                std::vector<Symbol*> &v = a->second;
+                std::stable_sort(std::find_if(v.begin(), v.end(), isDynamic), v.end(), byIndex);
             }
-            {
+        }
+        std::sort(dupOffsets.begin(), dupOffsets.end());
+        dupOffsets.erase(std::unique(dupOffsets.begin(), dupOffsets.end()), dupOffsets.end());
+        for (Offset off : dupOffsets) {
             dyn_c_hash_map<Offset,std::vector<Symbol*>>::accessor a2;
-            if(!symsByOffset_.insert(a2, {newsym->getOffset(), {newsym}}))
-                a2->second.push_back(newsym);
+            if (symsByOffset_.find(a2, off)) {
+                std::vector<Symbol*> &v = a2->second;
+                std::stable_sort(std::find_if(v.begin(), v.end(), isDynamic), v.end(), byIndex);
             }
         }
     }
@@ -3202,7 +3316,24 @@ bool ObjectELF::find_catch_blocks(Elf_X_Shdr *eh_frame,
     auto e_ident = (!eh_frame->isFromDebugFile()) ? elfHdr->e_ident() : elfHdrDbg->e_ident();
     result = read_except_table_gcc3(e_ident, mi, eh_frame, except_scn, catch_addrs);
 
-    sort(catch_addrs.begin(),catch_addrs.end(),exception_compare());
+    // Sort (tryStart, position) pairs rather than the blocks themselves.
+    // ExceptionBlock::tryStart() is an out-of-line call and the blocks have no
+    // move operations, so sorting them directly is slow.  The pairs are
+    // compared on tryStart alone, giving std::sort the same comparison
+    // results it would get from exception_compare, and therefore the same
+    // final order, including the order of blocks with equal tryStart.
+    std::vector<std::pair<Offset, size_t>> order(catch_addrs.size());
+    for (size_t i = 0; i < order.size(); ++i)
+        order[i] = std::make_pair(catch_addrs[i].tryStart(), i);
+    sort(order.begin(), order.end(),
+         [](const std::pair<Offset, size_t> &a, const std::pair<Offset, size_t> &b) {
+             return a.first < b.first;
+         });
+    std::vector<ExceptionBlock> sorted;
+    sorted.reserve(catch_addrs.size());
+    for (const auto &p : order)
+        sorted.push_back(catch_addrs[p.second]);
+    catch_addrs.swap(sorted);
 
     return result;
 }
@@ -4005,9 +4136,11 @@ bool ObjectELF::parse_all_relocations(Elf_X_Shdr *dynsym_scnp,
     // Symbols are only truly uniquely idenfitied by their index in their
     // respective symbol table (this really applies to the symbols associated
     // with sections) So, a map for each symbol table needs to be built so a
-    // relocation can be associated with the correct symbol
-    dyn_hash_map<int, Symbol *> symtabByIndex;
-    dyn_hash_map<int, Symbol *> dynsymByIndex;
+    // relocation can be associated with the correct symbol.  A symbol's index
+    // is its position in its table, so a vector indexed by position serves as
+    // the map.  Unused slots stay NULL, which reads as "no symbol".
+    std::vector<Symbol *> symtabByIndex(strtab ? symtab.count() : 0, NULL);
+    std::vector<Symbol *> dynsymByIndex(dynstr ? dynsym.count() : 0, NULL);
 
     dyn_c_hash_map<std::string, std::vector<Symbol *> >::iterator symVec_it;
     for (symVec_it = symbols_.begin(); symVec_it != symbols_.end(); ++symVec_it) {
@@ -4021,15 +4154,16 @@ bool ObjectELF::parse_all_relocations(Elf_X_Shdr *dynsym_scnp,
                 continue;
             }
 
-            std::pair<dyn_hash_map<int, Symbol *>::iterator, bool> result;
-            if ((*sym_it)->isInDynSymtab()) {
-                result = dynsymByIndex.insert(std::make_pair((*sym_it)->getIndex(), (*sym_it)));
-            } else {
-                result = symtabByIndex.insert(std::make_pair((*sym_it)->getIndex(), (*sym_it)));
-            }
+            std::vector<Symbol *> &byIndex =
+                (*sym_it)->isInDynSymtab() ? dynsymByIndex : symtabByIndex;
+            // A table that is absent here is never searched below
+            size_t index = (*sym_it)->getIndex();
+            if (index >= byIndex.size()) continue;
 
             // A symbol should be uniquely identified by its index in the symbol table
-            if (!result.second) continue;
+            if (byIndex[index] == NULL) {
+                byIndex[index] = *sym_it;
+            }
         }
     }
 
@@ -4041,12 +4175,55 @@ bool ObjectELF::parse_all_relocations(Elf_X_Shdr *dynsym_scnp,
         result = shToRegion.insert(std::make_pair((*reg_it)->getRegionNumber(), (*reg_it)));
     }
 
+    // Reserve each region's relocation list up front.  Growing it one
+    // push_back at a time reallocates repeatedly, and every discarded copy
+    // runs the AnnotatableSparse destructor.  Target regions only receive
+    // entries that have a symbol, so their count is an upper bound.
+    dyn_hash_map<Region *, size_t> relCounts;
+    for (size_t i = 0; i < allRegionHdrsByShndx.size(); ++i) {
+        auto shdr = allRegionHdrsByShndx[i];
+        if(!shdr) continue;
+        if (shdr->sh_type() != SHT_REL && shdr->sh_type() != SHT_RELA) continue;
+
+        size_t count = shdr->sh_size() / shdr->sh_entsize();
+        dyn_hash_map<unsigned, Region *>::iterator shToReg_it = shToRegion.find(i);
+        if (shToReg_it == shToRegion.end()) continue;
+        relCounts[shToReg_it->second] += count;
+        if (shdr->sh_info() != 0) {
+            shToReg_it = shToRegion.find(shdr->sh_info());
+            if (shToReg_it != shToRegion.end()) {
+                relCounts[shToReg_it->second] += count;
+            }
+        }
+    }
+    for (auto &rc : relCounts) {
+        rc.first->rels_.reserve(rc.first->rels_.size() + rc.second);
+    }
+
     for (size_t i = 0;
          i < allRegionHdrsByShndx.size();
             ++i) {
         auto shdr = allRegionHdrsByShndx[i];
         if(!shdr) continue;
         if (shdr->sh_type() != SHT_REL && shdr->sh_type() != SHT_RELA) continue;
+
+        // Entries are only recorded when the section maps to a region, and
+        // the region (and the sh_info target region) is the same for every
+        // entry of the section.
+        Region *region = NULL;
+        dyn_hash_map<unsigned, Region *>::iterator shToReg_it;
+        shToReg_it = shToRegion.find(i);
+        if (shToReg_it != shToRegion.end()) {
+            region = shToReg_it->second;
+        }
+        if (region == NULL) continue;
+        Region *targetRegion = NULL;
+        if (shdr->sh_info() != 0) {
+            shToReg_it = shToRegion.find(shdr->sh_info());
+            if (shToReg_it != shToRegion.end()) {
+                targetRegion = shToReg_it->second;
+            }
+        }
 
         Elf_X_Data reldata = shdr->get_data();
         Elf_X_Rel rel = reldata.get_rel();
@@ -4056,7 +4233,11 @@ bool ObjectELF::parse_all_relocations(Elf_X_Shdr *dynsym_scnp,
 
         // Apparently, relocation entries may not have associated symbols.
 
-        for (unsigned j = 0; j < (shdr->sh_size() / shdr->sh_entsize()); ++j) {
+        size_t nrels = shdr->sh_size() / shdr->sh_entsize();
+        bool hasTargets = shdr->sh_info() != 0;
+
+        // Builds the entry for index j and sets sym to its symbol (or NULL).
+        auto buildEntry = [&](size_t j, Symbol *&sym) {
             // Relocation entry fields - need to be populated
 
             Offset relOff, addend = 0;
@@ -4065,74 +4246,117 @@ bool ObjectELF::parse_all_relocations(Elf_X_Shdr *dynsym_scnp,
             Region::RegionType regType;
 
             long symbol_index;
-            switch (shdr->sh_type()) {
-                case SHT_REL:
-                    relType = rel.R_TYPE(j);
-                    relOff = rel.r_offset(j);
-                    symbol_index = rel.R_SYM(j);
-                    regType = Region::RT_REL;
-                    break;
-                case SHT_RELA:
-                    relType = rela.R_TYPE(j);
-                    relOff = rela.r_offset(j);
-                    symbol_index = rela.R_SYM(j);
-                    regType = Region::RT_RELA;
-                    addend = rela.r_addend(j);
-                    break;
-                default:
-                    continue;
+            if (shdr->sh_type() == SHT_REL) {
+                relType = rel.R_TYPE(j);
+                relOff = rel.r_offset(j);
+                symbol_index = rel.R_SYM(j);
+                regType = Region::RT_REL;
+            } else {
+                relType = rela.R_TYPE(j);
+                relOff = rela.r_offset(j);
+                symbol_index = rela.R_SYM(j);
+                regType = Region::RT_RELA;
+                addend = rela.r_addend(j);
             }
 
             // Determine which symbol table to use
-            Symbol *sym = NULL;
+            sym = NULL;
             Offset target = 0;
             // Use dynstr to ensure we've initialized dynsym...
             if (dynstr && curSymHdr && curSymHdr->sh_offset() == dynsym_offset) {
                 name = string(&dynstr[dynsym.st_name(symbol_index)]);
                 target = dynsym.st_value(symbol_index);
-                dyn_hash_map<int, Symbol *>::iterator sym_it;
-                sym_it = dynsymByIndex.find(symbol_index);
-                if (sym_it != dynsymByIndex.end()) {
-                    sym = sym_it->second;
+                sym = dynsymByIndex[symbol_index];
+                if (sym != NULL) {
                     if (sym->getType() == Symbol::ST_SECTION) {
                         name = sym->getRegion()->getRegionName().c_str();
                     }
                 }
             } else if (strtab && curSymHdr && curSymHdr->sh_offset() == symtab_offset) {
                 name = string(&strtab[symtab.st_name(symbol_index)]);
-                dyn_hash_map<int, Symbol *>::iterator sym_it;
-                sym_it = symtabByIndex.find(symbol_index);
-                if (sym_it != symtabByIndex.end()) {
-                    sym = sym_it->second;
+                sym = symtabByIndex[symbol_index];
+                if (sym != NULL) {
                     if (sym->getType() == Symbol::ST_SECTION) {
                         name = sym->getRegion()->getRegionName().c_str();
                     }
                 }
             }
+            return relocationEntry(target, relOff, addend, name, sym, relType, regType);
+        };
 
-            Region *region = NULL;
-            dyn_hash_map<unsigned, Region *>::iterator shToReg_it;
-            shToReg_it = shToRegion.find(i);
-            if (shToReg_it != shToRegion.end()) {
-                region = shToReg_it->second;
-            }
-
-            if (region != NULL) {
-                relocationEntry newrel(target, relOff, addend, name, sym, relType, regType);
+        if (!useParallelFill(nrels)) {
+            for (size_t j = 0; j < nrels; ++j) {
+                Symbol *sym;
+                relocationEntry newrel = buildEntry(j, sym);
                 region->addRelocationEntry(newrel);
                 // relocations are also stored with their targets
-                // Need to find target region
                 if (sym) {
-                    if (shdr->sh_info() != 0) {
-                        Region *targetRegion = NULL;
-                        shToReg_it = shToRegion.find(shdr->sh_info());
-                        if (shToReg_it != shToRegion.end()) {
-                            targetRegion = shToReg_it->second;
-                        }
+                    if (hasTargets) {
                         assert(targetRegion != NULL);
                         targetRegion->addRelocationEntry(newrel);
                     }
                 }
+            }
+            continue;
+        }
+
+        // In parallel, the entries are written straight into their final
+        // slots, so each region receives them in index order.  Every index
+        // produces one entry for the region; entries with a symbol also
+        // produce a copy for the sh_info target region.  A first pass finds
+        // which entries have a symbol, and a prefix count over it gives each
+        // copy its slot.  When the target region is the region itself, an
+        // entry's copy follows it directly, as in the serial loop.  Assigning
+        // into or destroying a relocationEntry reads the global annotation
+        // tables (AnnotatableSparse); nothing writes to them during these
+        // loops.
+        auto relSymbol = [&](size_t j) -> Symbol * {
+            long symbol_index = (shdr->sh_type() == SHT_REL) ? rel.R_SYM(j) : rela.R_SYM(j);
+            if (dynstr && curSymHdr && curSymHdr->sh_offset() == dynsym_offset)
+                return dynsymByIndex[symbol_index];
+            if (strtab && curSymHdr && curSymHdr->sh_offset() == symtab_offset)
+                return symtabByIndex[symbol_index];
+            return NULL;
+        };
+
+        // copiesBefore[j]: number of target copies made for entries before j
+        std::vector<size_t> copiesBefore(nrels + 1, 0);
+        if (hasTargets) {
+            std::vector<char> hasCopy(nrels);
+            #pragma omp parallel for schedule(static)
+            for (size_t j = 0; j < nrels; ++j)
+                hasCopy[j] = relSymbol(j) != NULL;
+            for (size_t j = 0; j < nrels; ++j)
+                copiesBefore[j + 1] = copiesBefore[j] + hasCopy[j];
+            if (copiesBefore[nrels] > 0)
+                assert(targetRegion != NULL);
+        }
+        size_t ncopies = copiesBefore[nrels];
+        bool sameRegion = (targetRegion == region);
+
+        size_t base = region->rels_.size();
+        region->rels_.resize(base + nrels + (sameRegion ? ncopies : 0));
+        size_t targetBase = 0;
+        if (hasTargets && !sameRegion && ncopies > 0) {
+            targetBase = targetRegion->rels_.size();
+            targetRegion->rels_.resize(targetBase + ncopies);
+        }
+
+        #pragma omp parallel for schedule(dynamic, 4096)
+        for (size_t j = 0; j < nrels; ++j) {
+            Symbol *sym;
+            relocationEntry newrel = buildEntry(j, sym);
+            // relocations are also stored with their targets
+            bool copy = sym && hasTargets;
+            if (sameRegion) {
+                size_t pos = base + j + copiesBefore[j];
+                region->rels_[pos] = newrel;
+                if (copy)
+                    region->rels_[pos + 1] = std::move(newrel);
+            } else {
+                if (copy)
+                    targetRegion->rels_[targetBase + copiesBefore[j]] = newrel;
+                region->rels_[base + j] = std::move(newrel);
             }
         }
     }
