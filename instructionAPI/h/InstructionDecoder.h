@@ -54,6 +54,11 @@ namespace Dyninst { namespace InstructionAPI {
     Instruction decode();
     Instruction decode(const unsigned char* buffer);
 
+    // Same result as 'decode().size()', and advances through the buffer the
+    // same way, but may skip building the instruction's operands. Returns 0
+    // at the end of the buffer or for bytes that cannot be decoded.
+    size_t decodeLength();
+
     struct DYNINST_EXPORT buffer {
       const unsigned char* start;
       const unsigned char* end;

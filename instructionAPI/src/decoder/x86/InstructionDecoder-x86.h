@@ -54,6 +54,7 @@ namespace Dyninst { namespace InstructionAPI {
 
   public:
     DYNINST_EXPORT virtual Instruction decode(InstructionDecoder::buffer& b);
+    DYNINST_EXPORT virtual size_t decodeLength(InstructionDecoder::buffer& b, bool& legal);
 
   protected:
     bool decodeOneOperand(const InstructionDecoder::buffer& b, const NS_x86::ia32_operand& operand,

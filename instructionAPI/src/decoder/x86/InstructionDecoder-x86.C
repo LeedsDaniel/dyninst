@@ -1916,4 +1916,23 @@ namespace Dyninst { namespace InstructionAPI {
     return insn;
   }
 
+  // The size 'decode' gives an instruction is fixed by 'decodeOpcode';
+  // 'decodeOperands' reads a copy of the buffer and does not change it.
+  DYNINST_EXPORT size_t InstructionDecoder_x86::decodeLength(InstructionDecoder::buffer& b,
+                                                             bool& legal) {
+    const unsigned char* start = b.start;
+    decodeOpcode(b);
+
+    // 'decode' moves the mnemonic into the Operation it builds. Drop it here
+    // so a later 'decode' does not pick up a stale one (it is only set for
+    // ENDBR32/ENDBR64).
+    m_Mnemonic.clear();
+
+    // Same test as Instruction::isValid for x86
+    legal = (m_EntryID != e_No_Entry);
+
+    // 'decode' stores the size in an 8-bit field
+    return static_cast<uint8_t>(b.start - start);
+  }
+
 }}

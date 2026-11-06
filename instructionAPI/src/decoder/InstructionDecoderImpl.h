@@ -61,6 +61,16 @@ namespace Dyninst { namespace InstructionAPI {
 
     virtual Instruction decode(InstructionDecoder::buffer &b) = 0;
 
+    // Advances 'b' exactly as 'decode(b)' would and returns the size of the
+    // instruction it would produce; 'legal' is set to its 'isLegalInsn()'.
+    // Decoders that can find the length without building the operands
+    // override this; the default does the full decode.
+    virtual size_t decodeLength(InstructionDecoder::buffer &b, bool &legal) {
+      Instruction insn = decode(b);
+      legal = insn.isLegalInsn();
+      return insn.size();
+    }
+
     static Ptr makeDecoderImpl(Architecture a);
 
   protected:

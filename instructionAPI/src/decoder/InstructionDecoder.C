@@ -87,25 +87,43 @@ namespace Dyninst { namespace InstructionAPI {
     m_Impl = InstructionDecoderImpl::makeDecoderImpl(arch);
   }
 
+  // Hand bytes the decoder could not decode to the user's callback
+  static Instruction decodeUnknown(InstructionDecoder::buffer& m_buf) {
+    constexpr auto maxInstructionLength = InstructionDecoder::maxInstructionLength;
+    auto const buf_len = static_cast<unsigned int>(m_buf.end - m_buf.start);
+    auto const size = (maxInstructionLength < buf_len) ? maxInstructionLength : buf_len;
+
+    // Don't let the user modify the real byte stream
+    std::array<unsigned char, maxInstructionLength> buf{};
+    std::copy_n(m_buf.start, size, buf.data());
+    InstructionDecoder::buffer user_buf{buf.data(), buf.data() + size};
+
+    auto user_ins = ::callback(user_buf);
+    m_buf.start += user_ins.size();
+    return user_ins;
+  }
+
   DYNINST_EXPORT Instruction InstructionDecoder::decode() {
     if(m_buf.start >= m_buf.end)
       return Instruction();
     Instruction const& ins = m_Impl->decode(m_buf);
 
     if(!ins.isLegalInsn() && ::callback) {
-      auto const buf_len = static_cast<unsigned int>(m_buf.end - m_buf.start);
-      auto const size = (maxInstructionLength < buf_len) ? maxInstructionLength : buf_len;
-
-      // Don't let the user modify the real byte stream
-      std::array<unsigned char, maxInstructionLength> buf{};
-      std::copy_n(m_buf.start, size, buf.data());
-      buffer user_buf{buf.data(), buf.data() + size};
-
-      auto user_ins = ::callback(user_buf);
-      m_buf.start += user_ins.size();
-      return user_ins;
+      return decodeUnknown(m_buf);
     }
     return ins;
+  }
+
+  DYNINST_EXPORT size_t InstructionDecoder::decodeLength() {
+    if(m_buf.start >= m_buf.end)
+      return Instruction().size();
+    bool legal = false;
+    size_t const len = m_Impl->decodeLength(m_buf, legal);
+
+    if(!legal && ::callback) {
+      return decodeUnknown(m_buf).size();
+    }
+    return len;
   }
 
   DYNINST_EXPORT Instruction InstructionDecoder::decode(const unsigned char* b) {

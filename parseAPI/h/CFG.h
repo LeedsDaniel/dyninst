@@ -30,6 +30,9 @@
 #ifndef _PARSER_CFG_H_
 #define _PARSER_CFG_H_
 
+// Block::getInsnLengths is available
+#define DYNINST_PARSEAPI_BLOCK_GETINSNLENGTHS 1
+
 #include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -238,6 +241,7 @@ class DYNINST_EXPORT Block :
     friend class Parser;
  public:
     typedef std::map<Offset, InstructionAPI::Instruction> Insns;
+    typedef std::vector<std::pair<Offset, size_t>> InsnLengths;
     typedef std::set<Edge*> edgelist;
 public:
     static Block * sink_block;
@@ -282,6 +286,10 @@ public:
 
     virtual void getInsns(Insns &insns) const;
     InstructionAPI::Instruction getInsn(Offset o) const;
+
+    /* The address and size of each instruction, in address order: the same
+     * as getInsns gives, without building the full instructions. */
+    void getInsnLengths(InsnLengths &lengths) const;
 
     bool wasUserAdded() const;
 

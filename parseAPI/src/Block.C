@@ -37,6 +37,8 @@ using namespace Dyninst::InstructionAPI;
 
 #include "debug_parse.h"
 
+#include <typeinfo>
+
 using namespace Dyninst;
 using namespace Dyninst::ParseAPI;
 
@@ -273,6 +275,36 @@ Block::getInsns(Insns &insns) const {
     Instruction insn = d.decode();
     insns[off] = insn;
     off += insn.size();
+  }
+}
+
+void
+Block::getInsnLengths(InsnLengths &lengths) const {
+  lengths.clear();
+
+  // getInsns is virtual, and a subclass may supply instructions that are not
+  // decoded from the block's bytes (e.g., GPU blocks), so only take the fast
+  // path for a plain Block.
+  if (typeid(*this) != typeid(Block)) {
+    Insns insns;
+    getInsns(insns);
+    for (auto const& i : insns)
+      lengths.emplace_back(i.first, i.second.size());
+    return;
+  }
+
+  // Same walk as Block::getInsns
+  Offset off = start();
+  const unsigned char *ptr =
+    (const unsigned char *)region()->getPtrToInstruction(off);
+  if (ptr == NULL) return;
+  InstructionDecoder d(ptr, size(), obj()->cs()->getArch());
+  while (off < end()) {
+    size_t len = d.decodeLength();
+    lengths.emplace_back(off, len);
+    // getInsns would loop forever here
+    if (len == 0) break;
+    off += len;
   }
 }
 
